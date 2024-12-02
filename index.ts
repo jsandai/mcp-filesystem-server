@@ -1,25 +1,32 @@
-      case "empty_trash": {
-        const parsed = EmptyTrashArgsSchema.safeParse(args);
+      case "zip_directory": {
+        const parsed = ZipDirectoryArgsSchema.safeParse(args);
         if (!parsed.success) {
-          throw new Error(`Invalid arguments for empty_trash: ${parsed.error}`);
+          throw new Error(`Invalid arguments for zip_directory: ${parsed.error}`);
         }
-        if (!parsed.data.confirm) {
-          return { content: [{ type: "text", text: "Please confirm emptying trash by setting confirm: true" }] };
+        try {
+          const validSourcePath = await validatePath(parsed.data.path);
+          const validDestPath = await validatePath(parsed.data.destination);
+          const zip = new AdmZip();
+          zip.addLocalFolder(validSourcePath);
+          zip.writeZip(validDestPath);
+          return { content: [{ type: "text", text: `Successfully compressed directory to ${parsed.data.destination}` }] };
+        } catch (error) {
+          throw new Error(`Failed to zip directory: ${error instanceof Error ? error.message : String(error)}`);
         }
-        const entries = await fs.readdir(trashDir);
-        await Promise.all(entries.map(entry => 
-          fs.rm(path.join(trashDir, entry), { force: true, recursive: true })
-        ));
-        return { content: [{ type: "text", text: `Successfully emptied trash directory` }] };
       }
 
-      case "restore_file": {
-        const parsed = RestoreFileArgsSchema.safeParse(args);
+      case "unzip_file": {
+        const parsed = UnzipFileArgsSchema.safeParse(args);
         if (!parsed.success) {
-          throw new Error(`Invalid arguments for restore_file: ${parsed.error}`);
+          throw new Error(`Invalid arguments for unzip_file: ${parsed.error}`);
         }
-        const trashPath = await validatePath(path.join(trashDir, parsed.data.path));
-        const originalPath = await validatePath(parsed.data.path);
-        await fs.rename(trashPath, originalPath);
-        return { content: [{ type: "text", text: `Successfully restored ${parsed.data.path} from trash` }] };
+        try {
+          const validSourcePath = await validatePath(parsed.data.source);
+          const validDestPath = await validatePath(parsed.data.destination);
+          const zip = new AdmZip(validSourcePath);
+          zip.extractAllTo(validDestPath, true);
+          return { content: [{ type: "text", text: `Successfully extracted zip file to ${parsed.data.destination}` }] };
+        } catch (error) {
+          throw new Error(`Failed to unzip file: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
