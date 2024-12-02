@@ -1,145 +1,99 @@
-// Schema definitions
-const ReadFileArgsSchema = z.object({
-  path: z.string(),
-});
+#!/usr/bin/env node
 
-const ReadMultipleFilesArgsSchema = z.object({
-  paths: z.array(z.string()),
-});
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ToolSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import fs from "fs/promises";
+import path from "path";
+import os from 'os';
+import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import AdmZip from "adm-zip";
 
-const WriteFileArgsSchema = z.object({
-  path: z.string(),
-  content: z.string(),
-});
-
-const CreateDirectoryArgsSchema = z.object({
-  path: z.string(),
-});
-
-const ListDirectoryArgsSchema = z.object({
-  path: z.string(),
-});
-
-const MoveFileArgsSchema = z.object({
-  source: z.string(),
-  destination: z.string(),
-});
-
-const SearchFilesArgsSchema = z.object({
-  path: z.string(),
-  pattern: z.string(),
-});
-
-const GetFileInfoArgsSchema = z.object({
-  path: z.string(),
-});
-
-const CopyFileArgsSchema = z.object({
-  source: z.string(),
-  destination: z.string(),
-});
-
-const BackupFileArgsSchema = z.object({
-  source: z.string(),
-  destinationDir: z.string(),
-});
-
-const DeleteFileArgsSchema = z.object({
-  path: z.string(),
-});
-
-const RestoreFileArgsSchema = z.object({
-  path: z.string(),
-});
-
-const EmptyTrashArgsSchema = z.object({
-  confirm: z.boolean().optional(),
-});
-
-const ZipDirectoryArgsSchema = z.object({
-  path: z.string(),
-  destination: z.string(),
-});
-
-const UnzipFileArgsSchema = z.object({
-  source: z.string(),
-  destination: z.string(),
-});
-
-const ListTrashArgsSchema = z.object({});
-
-const RestoreFromBackupArgsSchema = z.object({
-  backupPath: z.string(),
-  destination: z.string(),
-});
-
-// Utility functions
-interface FileInfo {
-  size: number;
-  created: Date;
-  modified: Date;
-  accessed: Date;
-  isDirectory: boolean;
-  isFile: boolean;
-  permissions: string;
+// Command line argument parsing
+const args = process.argv.slice(2);
+if (args.length === 0) {
+  console.error("Usage: mcp-server-filesystem <allowed-directory> [additional-directories...]");
+  process.exit(1);
 }
 
-async function getFileStats(filePath: string): Promise<FileInfo> {
-  const stats = await fs.stat(filePath);
-  return {
-    size: stats.size,
-    created: stats.birthtime,
-    modified: stats.mtime,
-    accessed: stats.atime,
-    isDirectory: stats.isDirectory(),
-    isFile: stats.isFile(),
-    permissions: stats.mode.toString(8).slice(-3),
-  };
+// Normalize all paths consistently
+function normalizePath(p: string): string {
+  return path.normalize(p).toLowerCase();
 }
 
-async function searchFiles(rootPath: string, pattern: string): Promise<string[]> {
-  const results: string[] = [];
+function expandHome(filepath: string): string {
+  if (filepath.startsWith('~/') || filepath === '~') {
+    return path.join(os.homedir(), filepath.slice(1));
+  }
+  return filepath;
+}
 
-  async function search(currentPath: string) {
-    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+// Store allowed directories in normalized form
+const allowedDirectories = args.map(dir => 
+  normalizePath(path.resolve(expandHome(dir)));
+);
 
-    for (const entry of entries) {
-      const fullPath = path.join(currentPath, entry.name);
-      
-      try {
-        await validatePath(fullPath);
-        if (entry.name.toLowerCase().includes(pattern.toLowerCase())) {
-          results.push(fullPath);
-        }
-        if (entry.isDirectory()) {
-          await search(fullPath);
-        }
-      } catch (error) {
-        continue;
-      }
+// Validate that all directories exist and are accessible
+await Promise.all(args.map(async (dir) => {
+  try {
+    const stats = await fs.stat(dir);
+    if (!stats.isDirectory()) {
+      console.error(`Error: ${dir} is not a directory`);
+      process.exit(1);
     }
+  } catch (error) {
+    console.error(`Error accessing directory ${dir}:`, error);
+    process.exit(1);
+  }
+}));
+
+// Create trash directory within the first allowed directory
+const trashDir = path.join(allowedDirectories[0], ".trash");
+await fs.mkdir(trashDir, { recursive: true });
+
+// Security utilities
+async function validatePath(requestedPath: string): Promise<string> {
+  const expandedPath = expandHome(requestedPath);
+  const absolute = path.isAbsolute(expandedPath)
+    ? path.resolve(expandedPath)
+    : path.resolve(process.cwd(), expandedPath);
+    
+  const normalizedRequested = normalizePath(absolute);
+
+  // Check if path is within allowed directories
+  const isAllowed = allowedDirectories.some(dir => normalizedRequested.startsWith(dir));
+  if (!isAllowed) {
+    throw new Error(`Access denied - path outside allowed directories: ${absolute} not in ${allowedDirectories.join(', ')}`);
   }
 
-  await search(rootPath);
-  return results;
+  // Handle symlinks by checking their real path
+  try {
+    const realPath = await fs.realpath(absolute);
+    const normalizedReal = normalizePath(realPath);
+    const isRealPathAllowed = allowedDirectories.some(dir => normalizedReal.startsWith(dir));
+    if (!isRealPathAllowed) {
+      throw new Error("Access denied - symlink target outside allowed directories");
+    }
+    return realPath;
+  } catch (error) {
+    // For new files that don't exist yet, verify parent directory
+    const parentDir = path.dirname(absolute);
+    try {
+      const realParentPath = await fs.realpath(parentDir);
+      const normalizedParent = normalizePath(realParentPath);
+      const isParentAllowed = allowedDirectories.some(dir => normalizedParent.startsWith(dir));
+      if (!isParentAllowed) {
+        throw new Error("Access denied - parent directory outside allowed directories");
+      }
+      return absolute;
+    } catch {
+      throw new Error(`Parent directory does not exist: ${parentDir}`);
+    }
+  }
 }
 
-// Advanced utility functions
-async function backupFile(args: { source: string; destinationDir: string }) {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const filename = path.basename(args.source);
-  const backupPath = path.join(
-    args.destinationDir,
-    `${filename}.${timestamp}.backup`
-  );
-  await fs.copyFile(args.source, backupPath);
-  return backupPath;
-}
-
-async function moveToTrash(filePath: string): Promise<string> {
-  const filename = path.basename(filePath);
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const trashPath = path.join(trashDir, `${filename}.${timestamp}`);
-  await fs.rename(filePath, trashPath);
-  return trashPath;
-}
